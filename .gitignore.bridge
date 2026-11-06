@@ -1,0 +1,6 @@
+# Merge these entries into the repository's .gitignore if needed:
+*.env.local
+.env.hermes
+hermes_tool_bridge/.env
+.dsk-cookie-cache/
+.pytest_cache/

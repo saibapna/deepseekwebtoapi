@@ -7,3 +7,11 @@ __pycache__/
 data/
 .openclaw-container-write-test
 .env.telegram-bot
+
+# Hermes bridge secrets and generated data
+.pytest_cache/
+*.env.local
+.env.hermes
+hermes_tool_bridge/.env
+dsk/cookies.json
+.dsk-cookie-cache/
