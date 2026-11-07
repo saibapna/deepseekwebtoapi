@@ -1,0 +1,33 @@
+name: Hermes Tool Bridge regression
+on:
+  push:
+    paths:
+      - 'hermes_tool_bridge/**'
+      - 'tests_hermes_tool_bridge/**'
+      - 'scripts/apply_dsk_stability.py'
+      - 'requirements-hermes-tool-bridge.txt'
+      - '.github/workflows/hermes-tool-bridge.yml'
+  pull_request:
+    paths:
+      - 'hermes_tool_bridge/**'
+      - 'tests_hermes_tool_bridge/**'
+      - 'scripts/apply_dsk_stability.py'
+      - 'requirements-hermes-tool-bridge.txt'
+      - '.github/workflows/hermes-tool-bridge.yml'
+permissions:
+  contents: read
+jobs:
+  bridge-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements-hermes-tool-bridge.txt
+      - run: python -m compileall -q hermes_tool_bridge scripts tests_hermes_tool_bridge
+      - run: python -m pytest -q tests_hermes_tool_bridge

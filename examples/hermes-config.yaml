@@ -1,0 +1,11 @@
+# Merge this named provider into ~/.hermes/config.yaml.
+# Store BRIDGE_API_KEY in ~/.hermes/.env, never in the repository.
+# Alternatively run `hermes model` -> Custom endpoint (recommended).
+providers:
+  deepseek4web-bridge:
+    api: http://127.0.0.1:8788/v1
+    key_env: BRIDGE_API_KEY
+    transport: chat_completions
+    default_model: deepseek-chat
+    discover_models: true
+# Select with: /model custom:deepseek4web-bridge:deepseek-chat
