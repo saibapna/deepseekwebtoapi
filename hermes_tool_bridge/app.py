@@ -1,4 +1,4 @@
-"""Hermes OpenAI-compatible tool-bridge API (tools are NEVER executed here)."""
+"""Hermes OpenAI-compatible hybrid tool gateway (never executes tools)."""
 from __future__ import annotations
 
 import hmac
@@ -13,7 +13,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contract import InvalidRequest, ModelProtocolError, ToolRegistry, make_prompt
-from .stream import StreamPump, collect_reply, completion_identity, completion_response, stream_frames
+from .hybrid import routed_frames, wire_frames
+from .native import NativeDeepSeekBackend, NativeUnsupported, NativeUnavailable
+from .stream import StreamPump, collect_reply, completion_identity, completion_response
 from .upstream import DeepSeekWebBackend
 
 
@@ -22,7 +24,7 @@ class Backend(Protocol):
 
 
 class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Hermes sends optional provider kwargs.
+    model_config = ConfigDict(extra="ignore")
     model: str = "deepseek-chat"
     messages: list[dict[str, Any]] = Field(min_length=1)
     tools: list[dict[str, Any]] = Field(default_factory=list)
@@ -31,9 +33,9 @@ class ChatRequest(BaseModel):
     stream: bool = False
     search_enabled: bool = False
     thinking_enabled: bool = False
-    temperature: float | None = None  # Web upstream does not support this.
+    temperature: float | None = None
     max_tokens: int | None = None
-    reasoning_effort: str | None = None  # Accepted but not mapped to web API.
+    reasoning_effort: str | None = None
 
 
 def _json_error(status: int, message: str, kind: str) -> JSONResponse:
@@ -47,8 +49,6 @@ def _auth(authorization: str | None, key_override: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Missing API bearer token")
     token = authorization[len("Bearer "):]
-    # compare_digest(str, str) requires ASCII. Reject Unicode headers rather
-    # than turning malformed authorization into an internal server error.
     if not token.isascii() or not expected.isascii() or not hmac.compare_digest(token, expected):
         raise HTTPException(401, "Invalid API bearer token")
 
@@ -60,19 +60,31 @@ def _num_workers() -> int:
         return 4
 
 
+def _enabled(name: str) -> bool:
+    return os.environ.get(name, "false").lower() in ("1", "true", "yes")
+
+
 def create_app(
     backend_factory: Callable[[bool, bool], Backend] | None = None,
     *,
+    native_factory: Callable[[], Any] | None = None,
     api_key: str | None = None,
     model_name: str = "deepseek-chat",
     heartbeat_seconds: float = 8.0,
     max_inflight: int | None = None,
+    tool_mode: str | None = None,
+    allow_web_fallback: bool | None = None,
 ) -> FastAPI:
     if heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds must be positive")
+    mode = (tool_mode or os.environ.get("BRIDGE_TOOL_MODE", "bridge")).strip().lower()
+    if mode not in ("bridge", "native", "hybrid"):
+        raise ValueError("BRIDGE_TOOL_MODE must be bridge, native, or hybrid")
+    fallback = _enabled("BRIDGE_ALLOW_WEB_FALLBACK") if allow_web_fallback is None else allow_web_fallback
     slots = threading.BoundedSemaphore(max_inflight or _num_workers())
-    factory = backend_factory or (lambda think, search: DeepSeekWebBackend(thinking=think, search=search))
-    app = FastAPI(title="DeepSeek4Web Hermes Tool Bridge", version="0.2.0")
+    web_factory = backend_factory or (lambda think, search: DeepSeekWebBackend(thinking=think, search=search))
+    official_factory = native_factory or NativeDeepSeekBackend
+    app = FastAPI(title="DeepSeek4Web Hermes Hybrid Gateway", version="0.3.0")
 
     @app.exception_handler(HTTPException)
     async def http_error(_request, exc: HTTPException):
@@ -85,7 +97,7 @@ def create_app(
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "component": "hermes-tool-bridge"}
+        return {"status": "ok", "component": "hermes-hybrid-gateway", "mode": mode}
 
     @app.get("/v1/models")
     def models(authorization: str | None = Header(default=None)):
@@ -99,30 +111,74 @@ def create_app(
             raise HTTPException(400, "Model is not supported by this bridge")
         try:
             registry = ToolRegistry.from_request(payload.tools, payload.tool_choice, payload.parallel_tool_calls)
-            prompt = make_prompt(payload.messages, registry)
+            prompt = make_prompt(payload.messages, registry)  # common bounds and message validation
         except (InvalidRequest, TypeError, ValueError, RecursionError, OverflowError) as exc:
             raise HTTPException(422, "Invalid tools, tool_choice, or message context") from exc
-
+        if mode == "native" and payload.search_enabled:
+            raise HTTPException(422, "Native route does not provide DeepSeek web search")
+        if mode == "hybrid" and payload.search_enabled and not fallback:
+            raise HTTPException(422, "DeepSeek web search requires explicit web fallback")
         if not slots.acquire(blocking=False):
             raise HTTPException(503, "Bridge is at concurrency capacity")
         identity = completion_identity(model_name)
-        def start():
-            return factory(payload.thinking_enabled, payload.search_enabled).iter_text(prompt)
+
+        def web():
+            return web_factory(payload.thinking_enabled, payload.search_enabled)
+
+        candidate = None
+        if mode != "bridge" and not (mode == "hybrid" and payload.search_enabled):
+            try:
+                candidate = official_factory()
+            except Exception:
+                slots.release()
+                return _json_error(503, "Native API is not configured", "configuration_error")
+        if mode == "native" and (candidate is None or not getattr(candidate, "configured", True)):
+            slots.release()
+            return _json_error(503, "Native API key is not configured", "configuration_error")
+        if mode == "hybrid" and not fallback and (candidate is None or not getattr(candidate, "configured", True)):
+            slots.release()
+            return _json_error(503, "Native API key is not configured", "configuration_error")
 
         if payload.stream:
             try:
-                pump = StreamPump(start, on_finish=slots.release, heartbeat=heartbeat_seconds).start()
+                routed_mode = "bridge" if mode == "hybrid" and payload.search_enabled else mode
+                producer = lambda: routed_frames(
+                    routed_mode, candidate, web, registry=registry, identity=identity,
+                    messages=payload.messages, tools=payload.tools, model=model_name,
+                    prompt=prompt, fallback_allowed=fallback, temperature=payload.temperature,
+                    max_tokens=payload.max_tokens,
+                )
+                pump = StreamPump(producer, on_finish=slots.release, heartbeat=heartbeat_seconds).start()
             except Exception:
                 slots.release()
-                raise HTTPException(502, "Cannot start upstream worker") from None
+                return _json_error(502, "Cannot start upstream worker", "upstream_error")
             return StreamingResponse(
-                stream_frames(pump, registry, identity),
-                media_type="text/event-stream",
+                wire_frames(pump), media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
             )
+
         try:
-            text, calls = collect_reply(start(), registry)
-            return completion_response(identity, text, calls)
+            if mode == "bridge" or (mode == "hybrid" and payload.search_enabled):
+                text, calls = collect_reply(web().iter_text(prompt), registry)
+                return completion_response(identity, text, calls)
+            if candidate is None or not getattr(candidate, "configured", True):
+                if mode == "hybrid" and fallback:
+                    text, calls = collect_reply(web().iter_text(prompt), registry)
+                    return completion_response(identity, text, calls)
+                raise NativeUnavailable("Native API key missing")
+            try:
+                result = candidate.complete(payload.messages, registry, payload.tools, model_name,
+                                            payload.temperature, payload.max_tokens)
+            except NativeUnsupported:
+                if mode != "hybrid" or not fallback:
+                    raise
+                text, calls = collect_reply(web().iter_text(prompt), registry)
+                return completion_response(identity, text, calls)
+            return completion_response(identity, result.content, result.calls)
+        except NativeUnavailable:
+            return _json_error(503, "Native API key is not configured", "configuration_error")
+        except NativeUnsupported:
+            return _json_error(502, "Native function calling unsupported", "native_unsupported")
         except ModelProtocolError:
             return _json_error(502, "Model tool decision failed validation", "tool_protocol_error")
         except Exception:

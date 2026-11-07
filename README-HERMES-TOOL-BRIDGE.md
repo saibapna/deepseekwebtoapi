@@ -1,4 +1,9 @@
-# DeepSeek4Web -> Hermes Agent: Hermes Tool Bridge (v0.2)
+# DeepSeek4Web -> Hermes Agent: Hermes Tool Bridge (v0.2 + hybrid v0.3)
+
+**New:** `docs/HERMES-HYBRID-v0.3.md` documents native DeepSeek API tool calling,
+opted-in web fallback, streaming, schema checks, and the v0.3 deployment mode.
+The `bridge` configuration remains the backwards-compatible default.
+
 
 This **additive patch** for `saibapna/deepseekwebtoapi` introduces a separate
 OpenAI-compatible model endpoint. It does not replace the existing `openai_api.py`. Use port **8788** so the legacy API can continue using **8787**.
@@ -123,8 +128,9 @@ multi-turn sessions or native role boundaries.
 - On disconnect, the producer receives a cancellation signal. Unblocked
   cleanup depends on the upstream read timeout; use the optional stability patch.
 
-The bridge is **tool-bridge only**: `dsk.api` does not accept native upstream
-function definitions. This patch does not claim native DeepSeek function calling.
+The **web bridge mode** is text/tool-envelope-only: `dsk.api` does not accept
+native tool definitions. **v0.3** adds official-API native tools as an independent
+opt-in transport; read `docs/HERMES-HYBRID-v0.3.md` before enabling it.
 
 ## Validation and capacity limits
 

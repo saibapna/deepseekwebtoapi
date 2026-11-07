@@ -162,6 +162,12 @@ class ToolRegistry:
         calls = payload.get("tool_calls")
         if not isinstance(calls, list) or not calls or len(calls) > (MAX_CALLS if self.parallel else 1):
             raise ModelProtocolError("Invalid tool call batch size")
+        return None, self.format_calls(calls)
+
+    def format_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Single fail-closed validation path for web and native tool proposals."""
+        if not self.enabled or not isinstance(calls, list) or not calls or len(calls) > (MAX_CALLS if self.parallel else 1):
+            raise ModelProtocolError("Invalid tool call batch size")
         formatted: list[dict[str, Any]] = []
         for call in calls:
             if not isinstance(call, dict) or set(call) != {"name", "arguments"}:
@@ -187,7 +193,31 @@ class ToolRegistry:
             if error is not None:
                 raise ModelProtocolError("Tool arguments failed schema validation")
             formatted.append({"id": "call_" + uuid.uuid4().hex, "type": "function", "function": {"name": name, "arguments": arguments_json}})
-        return None, formatted
+        return formatted
+
+    def format_native_calls(self, calls: Any) -> list[dict[str, Any]]:
+        """Treat official API function calls as untrusted JSON, not executable commands.
+
+        A fresh Hermes ID is generated for each validated call; native response IDs
+        are not allowed to cross the execution boundary.
+        """
+        if not isinstance(calls, list):
+            raise ModelProtocolError("Invalid native tool_calls")
+        proposed: list[dict[str, Any]] = []
+        for call in calls:
+            if not isinstance(call, dict) or call.get("type") != "function" or not isinstance(call.get("function"), dict):
+                raise ModelProtocolError("Invalid native function call")
+            fn = call["function"]
+            raw_args = fn.get("arguments")
+            if not isinstance(raw_args, str) or len(raw_args.encode("utf-8")) > MAX_ARGUMENT_BYTES:
+                raise ModelProtocolError("Native arguments invalid or too large")
+            try:
+                parsed = json.loads(raw_args, object_pairs_hook=_no_duplicate_keys, parse_constant=_invalid_constant)
+            except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+                raise ModelProtocolError("Native tool arguments are not valid JSON") from exc
+            proposed.append({"name": fn.get("name"), "arguments": parsed})
+        return self.format_calls(proposed)
+
 
 
 def _normalized_content(raw: Any, role: str) -> str:

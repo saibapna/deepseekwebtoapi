@@ -1,2 +1,2 @@
-"""Hermes Tool Bridge for deepseek4web-to-api. No tools are run by this package."""
-__version__ = "0.2.0"
+"""Hermes hybrid bridge for DeepSeek; never executes tools."""
+__version__ = "0.3.0"
